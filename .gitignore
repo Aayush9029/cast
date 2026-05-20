@@ -1,0 +1,15 @@
+# build artifact (binary at repo root)
+/cast
+
+# user's global ~/.gitignore ignores `target/` (Rust convention); we have a Go
+# package internal/target that needs to survive.
+!internal/target/
+!internal/target/*
+
+# editor
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+/bin/
