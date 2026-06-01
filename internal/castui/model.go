@@ -78,8 +78,10 @@ type model struct {
 	pctValue    float64
 	server      *http.Server
 	avt         *dlna.Client
+	rc          *dlna.RenderingControl
 	pollEvery   time.Duration
 	stopRequest bool
+	targetRetry bool
 
 	dlCh chan string
 
@@ -102,6 +104,15 @@ type servingStartedMsg struct {
 type stateMsg struct{ state string }
 type tickMsg time.Time
 type playbackErrMsg struct{ err error }
+type rediscoverDoneMsg struct {
+	tv  target.TV
+	err error
+}
+type controlDoneMsg struct {
+	status    string
+	transport string
+	err       error
+}
 type stoppedMsg struct{}
 
 func newModel(ctx context.Context, p Params) model {
@@ -120,6 +131,7 @@ func newModel(ctx context.Context, p Params) model {
 		spinner:   s,
 		prog:      pr,
 		avt:       avt,
+		rc:        dlna.NewRenderingControl(p.TV.IP),
 		pollEvery: 2 * time.Second,
 	}
 
@@ -182,11 +194,10 @@ func waitLineCmd(ch <-chan string) tea.Cmd {
 
 func startServerCmd(ctx context.Context, path, tvIP, port string) tea.Cmd {
 	return func() tea.Msg {
-		ip, err := cast.MyLANIP(tvIP)
+		streamURL, err := streamURLFor(path, tvIP, port)
 		if err != nil {
 			return playbackErrMsg{err: fmt.Errorf("lan ip: %w", err)}
 		}
-		streamURL := fmt.Sprintf("http://%s:%s/%s", ip, port, filepath.Base(path))
 		listener, err := net.Listen("tcp", "0.0.0.0:"+port)
 		if err != nil {
 			return playbackErrMsg{err: fmt.Errorf("listen: %w", err)}
@@ -200,6 +211,14 @@ func startServerCmd(ctx context.Context, path, tvIP, port string) tea.Cmd {
 		go func() { _ = srv.Serve(listener) }()
 		return servingStartedMsg{streamURL: streamURL, server: srv}
 	}
+}
+
+func streamURLFor(path, tvIP, port string) (string, error) {
+	ip, err := cast.MyLANIP(tvIP)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("http://%s:%s/%s", ip, port, filepath.Base(path)), nil
 }
 
 func playOnTVCmd(ctx context.Context, avt *dlna.Client, streamURL, title string, size int64) tea.Cmd {
@@ -233,15 +252,65 @@ func pollStateCmd(ctx context.Context, avt *dlna.Client, every time.Duration) te
 		if err != nil {
 			return stateMsg{state: "?"}
 		}
-		// Look for <CurrentTransportState>X</CurrentTransportState>.
-		if i := strings.Index(resp, "<CurrentTransportState>"); i >= 0 {
-			rest := resp[i+len("<CurrentTransportState>"):]
-			if j := strings.Index(rest, "</CurrentTransportState>"); j >= 0 {
-				return stateMsg{state: rest[:j]}
-			}
+		if state := dlna.CurrentTransportState(resp); state != "" {
+			return stateMsg{state: state}
 		}
 		return stateMsg{state: "?"}
 	})
+}
+
+func rediscoverTargetCmd(ctx context.Context, tv target.TV) tea.Cmd {
+	return func() tea.Msg {
+		fresh, err := target.Rediscover(ctx, tv)
+		return rediscoverDoneMsg{tv: fresh, err: err}
+	}
+}
+
+func togglePlayPauseCmd(ctx context.Context, avt *dlna.Client) tea.Cmd {
+	return func() tea.Msg {
+		callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		resp, err := avt.GetTransportInfo(callCtx)
+		if err != nil {
+			return controlDoneMsg{err: err}
+		}
+		if dlna.CurrentTransportState(resp) == "PLAYING" {
+			if _, err := avt.Pause(callCtx); err != nil {
+				return controlDoneMsg{err: err}
+			}
+			return controlDoneMsg{status: "paused", transport: "PAUSED_PLAYBACK"}
+		}
+		if _, err := avt.Play(callCtx); err != nil {
+			return controlDoneMsg{err: err}
+		}
+		return controlDoneMsg{status: "playing", transport: "PLAYING"}
+	}
+}
+
+func seekCmd(ctx context.Context, avt *dlna.Client, delta time.Duration) tea.Cmd {
+	return func() tea.Msg {
+		callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if _, err := avt.SeekRelative(callCtx, delta); err != nil {
+			return controlDoneMsg{err: err}
+		}
+		if delta < 0 {
+			return controlDoneMsg{status: "skipped back 15s"}
+		}
+		return controlDoneMsg{status: "skipped ahead 15s"}
+	}
+}
+
+func volumeCmd(ctx context.Context, rc *dlna.RenderingControl, delta int) tea.Cmd {
+	return func() tea.Msg {
+		callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		volume, err := rc.AdjustVolume(callCtx, delta)
+		if err != nil {
+			return controlDoneMsg{err: err}
+		}
+		return controlDoneMsg{status: fmt.Sprintf("volume %d", volume)}
+	}
 }
 
 func stopOnTVCmd(avt *dlna.Client, srv *http.Server) tea.Cmd {
@@ -362,12 +431,69 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		)
 
 	case stateMsg:
+		if m.phase != phaseServing {
+			return m, nil
+		}
 		m.transport = msg.state
 		return m, pollStateCmd(m.ctx, m.avt, m.pollEvery)
 
 	case playbackErrMsg:
+		if !m.targetRetry && m.p.TV.Source != "flag" && shouldRescanPlaybackError(msg.err) {
+			m.targetRetry = true
+			m.transport = "rescanning..."
+			m.appendLog("TV stopped responding; rescanning...")
+			return m, rediscoverTargetCmd(m.ctx, m.p.TV)
+		}
 		m.phase = phaseError
 		m.err = msg.err.Error()
+		return m, nil
+
+	case rediscoverDoneMsg:
+		if msg.err != nil {
+			m.phase = phaseError
+			m.err = "playback failed, and auto-rescan found no replacement TV: " + msg.err.Error()
+			return m, nil
+		}
+		oldIP := m.p.TV.IP
+		m.p.TV = msg.tv
+		m.avt = dlna.New(msg.tv.IP)
+		m.rc = dlna.NewRenderingControl(msg.tv.IP)
+		streamURL, err := streamURLFor(m.cachePath, msg.tv.IP, m.p.HTTPPort)
+		if err != nil {
+			m.phase = phaseError
+			m.err = err.Error()
+			return m, nil
+		}
+		m.streamURL = streamURL
+		if msg.tv.IP != oldIP {
+			m.appendLog("found TV at " + msg.tv.IP)
+		}
+		var size int64
+		if st, err := os.Stat(m.cachePath); err == nil {
+			size = st.Size()
+		}
+		return m, tea.Batch(
+			playOnTVCmd(m.ctx, m.avt, m.streamURL, m.title, size),
+			pollStateCmd(m.ctx, m.avt, m.pollEvery),
+		)
+
+	case controlDoneMsg:
+		if msg.err != nil {
+			if !m.targetRetry && m.p.TV.Source != "flag" && shouldRescanPlaybackError(msg.err) {
+				m.targetRetry = true
+				m.transport = "rescanning..."
+				m.appendLog("TV stopped responding; rescanning...")
+				return m, rediscoverTargetCmd(m.ctx, m.p.TV)
+			}
+			m.appendLog("control failed: " + msg.err.Error())
+			return m, nil
+		}
+		if msg.transport != "" {
+			m.transport = msg.transport
+		}
+		if msg.status != "" {
+			m.appendLog(msg.status)
+		}
 		return m, nil
 
 	case stoppedMsg:
@@ -385,6 +511,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.phase == phaseServing && !m.stopRequest {
 				m.stopRequest = true
 				return m, stopOnTVCmd(m.avt, m.server)
+			}
+		case " ", "space":
+			if m.phase == phaseServing {
+				return m, togglePlayPauseCmd(m.ctx, m.avt)
+			}
+		case "up":
+			if m.phase == phaseServing {
+				return m, volumeCmd(m.ctx, m.rc, 5)
+			}
+		case "down":
+			if m.phase == phaseServing {
+				return m, volumeCmd(m.ctx, m.rc, -5)
+			}
+		case "left":
+			if m.phase == phaseServing {
+				return m, seekCmd(m.ctx, m.avt, -15*time.Second)
+			}
+		case "right":
+			if m.phase == phaseServing {
+				return m, seekCmd(m.ctx, m.avt, 15*time.Second)
 			}
 		}
 	}
@@ -443,6 +589,9 @@ func (m model) View() string {
 	}
 
 	footer := tui.Footer.Render(tui.FormatHints([]tui.HintItem{
+		{Key: "↑/↓", Label: "volume"},
+		{Key: "←/→", Label: "seek 15s"},
+		{Key: "space", Label: "play/pause"},
 		{Key: "s", Label: "stop"},
 		{Key: "q", Label: "quit"},
 	}))
@@ -461,4 +610,18 @@ func keyTitle(key string) string {
 		return key[i+1:]
 	}
 	return key
+}
+
+func shouldRescanPlaybackError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "soap ") ||
+		strings.Contains(msg, "dial tcp") ||
+		strings.Contains(msg, "connect:") ||
+		strings.Contains(msg, "host is down") ||
+		strings.Contains(msg, "network is unreachable") ||
+		strings.Contains(msg, "no route to host") ||
+		strings.Contains(msg, "i/o timeout")
 }

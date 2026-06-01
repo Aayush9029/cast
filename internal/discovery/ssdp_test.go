@@ -1,6 +1,7 @@
 package discovery
 
 import (
+	"net"
 	"strings"
 	"testing"
 )
@@ -141,5 +142,36 @@ func TestResolveServiceURL(t *testing.T) {
 	d, _ := parseDescriptor("http://10.0.0.7:9197/dmr", []byte(sampleSamsungDescriptor))
 	if !strings.HasPrefix(d.AVTransportURL, "http://10.0.0.7:9197/") {
 		t.Fatalf("relative path resolution wrong: %q", d.AVTransportURL)
+	}
+}
+
+func TestHostsForNetworkUsesInterfaceCIDR(t *testing.T) {
+	hosts := hostsForNetwork(net.ParseIP("10.20.30.40"), net.CIDRMask(24, 32))
+	if len(hosts) != 253 {
+		t.Fatalf("host count = %d, want 253", len(hosts))
+	}
+	if hosts[0] != "10.20.30.1" {
+		t.Fatalf("first host = %q", hosts[0])
+	}
+	if hosts[len(hosts)-1] != "10.20.30.254" {
+		t.Fatalf("last host = %q", hosts[len(hosts)-1])
+	}
+	for _, host := range hosts {
+		if host == "10.20.30.40" {
+			t.Fatal("local interface IP should not be scanned")
+		}
+	}
+}
+
+func TestHostsForNetworkCapsBroadSubnetToLocal24(t *testing.T) {
+	hosts := hostsForNetwork(net.ParseIP("172.16.42.9"), net.CIDRMask(16, 32))
+	if len(hosts) == 0 {
+		t.Fatal("expected local /24 fallback hosts")
+	}
+	if hosts[0] != "172.16.42.1" {
+		t.Fatalf("first host = %q", hosts[0])
+	}
+	if hosts[len(hosts)-1] != "172.16.42.254" {
+		t.Fatalf("last host = %q", hosts[len(hosts)-1])
 	}
 }

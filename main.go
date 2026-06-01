@@ -106,11 +106,50 @@ func run() error {
 
 	switch args[0] {
 	case "stop":
-		_, err := dlna.New(tv.IP).Stop(ctx)
-		return err
+		return withAutoRediscover(ctx, tv, *tvIP == "", func(tv target.TV) error {
+			callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			_, err := dlna.New(tv.IP).Stop(callCtx)
+			if err == nil {
+				fmt.Println("stopped")
+			}
+			return err
+		})
 	default:
-		return cmdCast(ctx, tv, args[0])
+		return withAutoRediscover(ctx, tv, *tvIP == "", func(tv target.TV) error {
+			return cmdCast(ctx, tv, args[0])
+		})
 	}
+}
+
+func withAutoRediscover(ctx context.Context, tv target.TV, allow bool, run func(target.TV) error) error {
+	err := run(tv)
+	if err == nil || !allow || !shouldRescanAfter(err) {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "TV at %s stopped responding; rescanning...\n", tv.IP)
+	fresh, scanErr := target.Rediscover(ctx, tv)
+	if scanErr != nil {
+		return fmt.Errorf("%w\n\nauto-rescan failed: %v", err, scanErr)
+	}
+	if fresh.IP != tv.IP {
+		fmt.Fprintf(os.Stderr, "found TV at %s; retrying...\n", fresh.IP)
+	}
+	return run(fresh)
+}
+
+func shouldRescanAfter(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "soap ") ||
+		strings.Contains(msg, "dial tcp") ||
+		strings.Contains(msg, "connect:") ||
+		strings.Contains(msg, "host is down") ||
+		strings.Contains(msg, "network is unreachable") ||
+		strings.Contains(msg, "no route to host") ||
+		strings.Contains(msg, "i/o timeout")
 }
 
 func cmdDiscover(ctx context.Context) error {
@@ -119,6 +158,7 @@ func cmdDiscover(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	devs = reachableDiscoveredTVs(ctx, devs)
 	if len(devs) == 0 {
 		return errors.New("no Samsung TVs found on this network")
 	}
@@ -148,6 +188,19 @@ func cmdDiscover(ctx context.Context) error {
 	}
 	fmt.Printf("saved: %s  %s  %s\n", pick.FriendlyName, pick.Model, pick.IP)
 	return nil
+}
+
+func reachableDiscoveredTVs(ctx context.Context, devs []discovery.Device) []discovery.Device {
+	out := make([]discovery.Device, 0, len(devs))
+	for _, d := range devs {
+		if d.IP == "" {
+			continue
+		}
+		if err := target.CheckAVTransport(ctx, d.IP); err == nil {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 func cmdCache() error {

@@ -22,10 +22,13 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 )
+
+const samsungDLNAPort = "9197"
 
 // Device is a flattened view of a Samsung-like UPnP MediaRenderer with the
 // service control URLs the rest of the toolkit needs (AVTransport for casting,
@@ -54,7 +57,14 @@ func Discover(ctx context.Context, total time.Duration) ([]Device, error) {
 	scanCtx, cancel := context.WithTimeout(ctx, total)
 	defer cancel()
 
-	locations, err := mSearch(scanCtx, []string{
+	ssdpTotal := total
+	if ssdpTotal > 2500*time.Millisecond {
+		ssdpTotal = 2500 * time.Millisecond
+	}
+	ssdpCtx, ssdpCancel := context.WithTimeout(scanCtx, ssdpTotal)
+	defer ssdpCancel()
+
+	locations, err := mSearch(ssdpCtx, []string{
 		"urn:schemas-upnp-org:device:MediaRenderer:1",
 		"ssdp:all",
 	})
@@ -89,6 +99,15 @@ func Discover(ctx context.Context, total time.Duration) ([]Device, error) {
 		}()
 	}
 	wg.Wait()
+
+	if len(seen) == 0 {
+		for _, d := range discoverByPort(scanCtx) {
+			if d.IP == "" {
+				continue
+			}
+			seen[d.IP] = d
+		}
+	}
 
 	out := make([]Device, 0, len(seen))
 	for _, d := range seen {
@@ -271,4 +290,167 @@ func looksLikeSamsungTV(d Device) bool {
 		return true
 	}
 	return false
+}
+
+func discoverByPort(ctx context.Context) []Device {
+	hosts, err := localSubnetHosts()
+	if err != nil || len(hosts) == 0 {
+		return nil
+	}
+
+	const workers = 64
+	jobs := make(chan string)
+	results := make(chan Device, len(hosts))
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ip := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				d, ok := probeSamsungDLNA(ctx, ip)
+				if ok {
+					results <- d
+				}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(jobs)
+		for _, host := range hosts {
+			select {
+			case jobs <- host:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	seen := map[string]Device{}
+	for d := range results {
+		if d.IP != "" {
+			seen[d.IP] = d
+		}
+	}
+
+	out := make([]Device, 0, len(seen))
+	for _, d := range seen {
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].IP < out[j].IP })
+	return out
+}
+
+func probeSamsungDLNA(ctx context.Context, ip string) (Device, bool) {
+	if err := probeTCP(ctx, ip, samsungDLNAPort, 350*time.Millisecond); err != nil {
+		return Device{}, false
+	}
+	for _, path := range []string{"/dmr", "/description.xml", "/rootDesc.xml", "/upnp/desc.xml"} {
+		d, err := fetchDevice(ctx, "http://"+net.JoinHostPort(ip, samsungDLNAPort)+path)
+		if err == nil && looksLikeSamsungTV(d) {
+			return d, true
+		}
+	}
+	return Device{}, false
+}
+
+func probeTCP(ctx context.Context, ip, port string, timeout time.Duration) error {
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(probeCtx, "tcp", net.JoinHostPort(ip, port))
+	if err != nil {
+		return err
+	}
+	return conn.Close()
+}
+
+func localSubnetHosts() ([]string, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]struct{}{}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ip, ipNet, ok := ipv4Network(addr)
+			if !ok {
+				continue
+			}
+			for _, host := range hostsForNetwork(ip, ipNet.Mask) {
+				seen[host] = struct{}{}
+			}
+		}
+	}
+
+	out := make([]string, 0, len(seen))
+	for host := range seen {
+		out = append(out, host)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func ipv4Network(addr net.Addr) (net.IP, *net.IPNet, bool) {
+	ipNet, ok := addr.(*net.IPNet)
+	if !ok {
+		return nil, nil, false
+	}
+	ip := ipNet.IP.To4()
+	if ip == nil || ip[0] == 127 || ip[0] == 169 && ip[1] == 254 {
+		return nil, nil, false
+	}
+	return ip, ipNet, true
+}
+
+func hostsForNetwork(ip net.IP, mask net.IPMask) []string {
+	ip = ip.To4()
+	if ip == nil {
+		return nil
+	}
+	prefix, bits := mask.Size()
+	if bits != 32 || prefix == 32 {
+		return nil
+	}
+	if prefix < 24 {
+		prefix = 24
+		mask = net.CIDRMask(prefix, 32)
+	}
+	count := 1 << (32 - prefix)
+	if count > 256 {
+		return nil
+	}
+
+	network := ipv4ToUint32(ip) & ipv4ToUint32(net.IP(mask).To4())
+	hosts := make([]string, 0, max(count-2, 0))
+	for i := uint32(1); i < uint32(count)-1; i++ {
+		host := uint32ToIPv4(network + i).String()
+		if host != ip.String() {
+			hosts = append(hosts, host)
+		}
+	}
+	return hosts
+}
+
+func ipv4ToUint32(ip net.IP) uint32 {
+	ip = ip.To4()
+	return uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3])
+}
+
+func uint32ToIPv4(n uint32) net.IP {
+	return net.IPv4(byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
 }

@@ -14,11 +14,22 @@ package target
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
 	"github.com/Aayush9029/cast/internal/config"
 	"github.com/Aayush9029/cast/internal/discovery"
+)
+
+const avTransportPort = "9197"
+
+var (
+	loadConfig        = config.Load
+	saveConfig        = config.Save
+	discoverDevices   = discovery.Discover
+	checkAVTransport  = CheckAVTransport
+	avTransportDialer = (&net.Dialer{}).DialContext
 )
 
 // TV is the resolved target with whatever metadata we could gather.
@@ -28,7 +39,7 @@ type TV struct {
 	Model string
 
 	// Source describes how the IP was resolved, useful for header banners.
-	// One of: "flag", "config", "discovery".
+	// One of: "flag", "config", "discovery", "rediscovery".
 	Source string
 }
 
@@ -63,41 +74,124 @@ func (e MultipleError) Error() string {
 	return b.String()
 }
 
-// Resolve walks the precedence chain. flagIP wins when non-empty. The context
-// only bounds SSDP - config/flag paths return immediately.
+// Resolve walks the precedence chain. Saved targets are probed before use so
+// stale DHCP leases trigger SSDP rediscovery instead of a later SOAP failure.
 func Resolve(ctx context.Context, flagIP string) (TV, error) {
 	if flagIP != "" {
+		if err := checkAVTransport(ctx, flagIP); err != nil {
+			return TV{}, fmt.Errorf("TV did not respond at %s:%s: %w", flagIP, avTransportPort, err)
+		}
 		return TV{IP: flagIP, Source: "flag"}, nil
 	}
-	if c, err := config.Load(); err == nil && c.TVIP != "" {
-		return TV{
+	c, err := loadConfig()
+	if err != nil {
+		return TV{}, fmt.Errorf("load config: %w", err)
+	}
+	if c.TVIP != "" {
+		tv := TV{
 			IP:     c.TVIP,
 			Name:   c.TVName,
 			Model:  c.TVModel,
 			Source: "config",
-		}, nil
+		}
+		if err := checkAVTransport(ctx, tv.IP); err == nil {
+			return tv, nil
+		}
+		return rediscover(ctx, c)
 	}
 
+	return rediscover(ctx, config.Config{})
+}
+
+// Rediscover ignores the saved IP, scans again, saves the chosen target, and
+// returns it. It is used when a SOAP command fails after initial resolution.
+func Rediscover(ctx context.Context, previous TV) (TV, error) {
+	return rediscover(ctx, config.Config{
+		TVIP:    previous.IP,
+		TVName:  previous.Name,
+		TVModel: previous.Model,
+	})
+}
+
+func rediscover(ctx context.Context, previous config.Config) (TV, error) {
 	scanCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
-	devs, err := discovery.Discover(scanCtx, 4*time.Second)
+	devs, err := discoverDevices(scanCtx, 4*time.Second)
 	if err != nil {
 		return TV{}, fmt.Errorf("SSDP discovery failed: %w", err)
 	}
+	devs = reachableDevices(ctx, devs)
 	switch len(devs) {
 	case 0:
 		return TV{}, NotFoundError{}
 	case 1:
-		d := devs[0]
-		return TV{
-			IP:     d.IP,
-			Name:   d.FriendlyName,
-			Model:  d.Model,
-			Source: "discovery",
-		}, nil
+		return saveAndReturn(devs[0], sourceFor(previous))
 	default:
+		if d, ok := matchPrevious(devs, previous); ok {
+			return saveAndReturn(d, "rediscovery")
+		}
 		return TV{}, MultipleError{Devices: devs}
 	}
+}
+
+func sourceFor(previous config.Config) string {
+	if previous.TVIP == "" && previous.TVName == "" && previous.TVModel == "" {
+		return "discovery"
+	}
+	return "rediscovery"
+}
+
+func reachableDevices(ctx context.Context, devs []discovery.Device) []discovery.Device {
+	out := make([]discovery.Device, 0, len(devs))
+	for _, d := range devs {
+		if d.IP == "" {
+			continue
+		}
+		if err := checkAVTransport(ctx, d.IP); err == nil {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func matchPrevious(devs []discovery.Device, previous config.Config) (discovery.Device, bool) {
+	if previous.TVName == "" && previous.TVModel == "" {
+		return discovery.Device{}, false
+	}
+	var matches []discovery.Device
+	for _, d := range devs {
+		nameMatches := previous.TVName != "" && d.FriendlyName == previous.TVName
+		modelMatches := previous.TVModel != "" && d.Model == previous.TVModel
+		if nameMatches || modelMatches {
+			matches = append(matches, d)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0], true
+	}
+	return discovery.Device{}, false
+}
+
+func saveAndReturn(d discovery.Device, source string) (TV, error) {
+	_ = saveConfig(config.Config{
+		TVIP:             d.IP,
+		TVName:           d.FriendlyName,
+		TVModel:          d.Model,
+		LastDiscoveredAt: time.Now().UTC(),
+	})
+	return TV{IP: d.IP, Name: d.FriendlyName, Model: d.Model, Source: source}, nil
+}
+
+// CheckAVTransport verifies that the TV's DLNA control port accepts TCP.
+func CheckAVTransport(ctx context.Context, ip string) error {
+	probeCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer cancel()
+
+	conn, err := avTransportDialer(probeCtx, "tcp", net.JoinHostPort(ip, avTransportPort))
+	if err != nil {
+		return err
+	}
+	return conn.Close()
 }
 
 // Banner formats a resolved TV for header rendering, e.g.

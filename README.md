@@ -31,7 +31,9 @@ cast discover                   # pick a TV (only needed when you have several)
 cast stop                       # stop playback
 ```
 
-The TV is auto-discovered via SSDP on first run. Subsequent casts go to the saved TV at `~/.config/cast/config.json`. URL casting needs `yt-dlp` and `ffmpeg` (`brew install yt-dlp ffmpeg`).
+While casting, use the TUI controls: `space` toggles play/pause, `←`/`→` seek 15 seconds, `↑`/`↓` adjust volume, `s` stops playback, and `q` quits.
+
+The TV is auto-discovered via SSDP on first run. Subsequent casts go to the saved TV at `~/.config/cast/config.json`; if that IP stops responding, `cast` rescans the local network and updates the saved target. URL casting needs `yt-dlp` and `ffmpeg` (`brew install yt-dlp ffmpeg`).
 
 ## Why this exists
 
