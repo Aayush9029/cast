@@ -655,6 +655,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.audioDelay += 250 * time.Millisecond
 				return m, nudgeAudioCmd(m.ctx, m.avt, m.player, m.audioDelay)
 			}
+		case "(":
+			if m.phase == phaseServing && m.player != nil {
+				m.audioDelay -= 10 * time.Millisecond
+				return m, nudgeAudioCmd(m.ctx, m.avt, m.player, m.audioDelay)
+			}
+		case ")":
+			if m.phase == phaseServing && m.player != nil {
+				m.audioDelay += 10 * time.Millisecond
+				return m, nudgeAudioCmd(m.ctx, m.avt, m.player, m.audioDelay)
+			}
 		}
 	}
 	return m, nil
@@ -725,6 +735,7 @@ func (m model) View() string {
 	}
 	if m.p.LocalAudio {
 		hints = append(hints, tui.HintItem{Key: "[/]", Label: "delay ±25ms"})
+		hints = append(hints, tui.HintItem{Key: "(/)", Label: "±10ms"})
 		hints = append(hints, tui.HintItem{Key: "{/}", Label: "±250ms"})
 	}
 	hints = append(hints,
