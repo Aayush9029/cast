@@ -18,19 +18,35 @@ import (
 	"time"
 )
 
-// ResyncThreshold is the drift past which the player reseeks. Below it, the
-// occasional restart click is more disruptive than the gap.
-const ResyncThreshold = 300 * time.Millisecond
+// Sync tuning. The local Mac audio clock is stable, so once aligned the audio
+// can free-run; the thing we must NOT do is chase the TV's reported position
+// continuously — Samsung's DLNA RelTime lags by seconds and freezes while
+// buffering, so reacting to every wobble would knock a hand-tuned offset out
+// of place. We therefore only re-seek on a LARGE drift that PERSISTS across
+// several polls (a genuine seek/rebuffer, not RelTime noise).
+const (
+	// ResyncThreshold is the drift past which a re-seek is considered.
+	ResyncThreshold = 750 * time.Millisecond
+	// ResyncStreak is how many consecutive over-threshold polls must occur
+	// before we actually re-seek, debouncing transient TV-clock noise.
+	ResyncStreak = 3
+	// DefaultStartupLatency pre-rolls the seek to cover the time between
+	// launching ffplay and audio actually leaving the speakers, so the first
+	// alignment lands right instead of landing ~this much behind.
+	DefaultStartupLatency = 250 * time.Millisecond
+)
 
 // Player drives a single ffplay subprocess against one media file.
 type Player struct {
 	file string
 
-	mu        sync.Mutex
-	cmd       *exec.Cmd
-	startPos  time.Duration // -ss value of the running process
-	startedAt time.Time     // wall clock at process launch
-	clock     func() time.Time
+	mu             sync.Mutex
+	cmd            *exec.Cmd
+	startPos       time.Duration // -ss value of the running process
+	startedAt      time.Time     // wall clock at process launch
+	clock          func() time.Time
+	startupLatency time.Duration
+	overStreak     int // consecutive over-threshold polls
 }
 
 // Available reports whether ffplay is on PATH.
@@ -41,10 +57,12 @@ func Available() bool {
 
 // New builds a Player for file. It does not start playback.
 func New(file string) *Player {
-	return &Player{file: file, clock: time.Now}
+	return &Player{file: file, clock: time.Now, startupLatency: DefaultStartupLatency}
 }
 
-// PlayFrom kills any running process and starts ffplay seeked to pos.
+// PlayFrom kills any running process and starts ffplay aligned to pos. The seek
+// is pre-rolled by startupLatency so that, once audio actually leaves the
+// speakers, it matches pos rather than landing startupLatency behind it.
 func (p *Player) PlayFrom(pos time.Duration) error {
 	if pos < 0 {
 		pos = 0
@@ -53,23 +71,26 @@ func (p *Player) PlayFrom(pos time.Duration) error {
 	defer p.mu.Unlock()
 	p.killLocked()
 
-	secs := pos.Seconds()
+	seekTo := pos + p.startupLatency
 	cmd := exec.Command("ffplay",
 		"-nodisp", "-autoexit", "-vn",
 		"-loglevel", "quiet",
-		"-ss", fmt.Sprintf("%.3f", secs),
+		"-fflags", "nobuffer",
+		"-ss", fmt.Sprintf("%.3f", seekTo.Seconds()),
 		"-i", p.file,
 	)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start ffplay: %w", err)
 	}
 	p.cmd = cmd
-	p.startPos = pos
+	p.startPos = seekTo
 	p.startedAt = p.clock()
+	p.overStreak = 0
 	return nil
 }
 
-// Position estimates the running track position from wall-clock elapsed time.
+// Position estimates the audible track position: elapsed wall-clock since
+// launch, less the startup latency during which no sound was produced.
 // Returns false when nothing is playing.
 func (p *Player) Position() (time.Duration, bool) {
 	p.mu.Lock()
@@ -77,7 +98,7 @@ func (p *Player) Position() (time.Duration, bool) {
 	if p.cmd == nil {
 		return 0, false
 	}
-	return p.startPos + p.clock().Sub(p.startedAt), true
+	return p.startPos + p.clock().Sub(p.startedAt) - p.startupLatency, true
 }
 
 // Running reports whether a process is active.
@@ -105,9 +126,11 @@ func (p *Player) killLocked() {
 	p.cmd = nil
 }
 
-// Sync chases tvPos+offset: starts the player if idle, or reseeks when drift
-// exceeds ResyncThreshold. It returns the measured drift (player − target) and
-// whether a (re)seek was issued.
+// Sync aligns local audio to tvPos+offset. It starts the player when idle and
+// otherwise lets it free-run, only re-seeking when the drift stays past
+// ResyncThreshold for ResyncStreak consecutive polls — that debounce is what
+// keeps a hand-tuned offset from being wrecked by the TV's noisy clock.
+// It returns the measured drift (player − target) and whether a seek was issued.
 func (p *Player) Sync(tvPos, offset time.Duration) (drift time.Duration, reseeked bool, err error) {
 	target := tvPos + offset
 	cur, ok := p.Position()
@@ -115,13 +138,19 @@ func (p *Player) Sync(tvPos, offset time.Duration) (drift time.Duration, reseeke
 		return 0, true, p.PlayFrom(target)
 	}
 	drift = cur - target
-	if drift < 0 {
-		drift = -drift
+	mag := drift
+	if mag < 0 {
+		mag = -mag
 	}
-	if drift > ResyncThreshold {
-		return drift, true, p.PlayFrom(target)
+	if mag <= ResyncThreshold {
+		p.overStreak = 0
+		return drift, false, nil
 	}
-	return drift, false, nil
+	p.overStreak++
+	if p.overStreak < ResyncStreak {
+		return drift, false, nil
+	}
+	return drift, true, p.PlayFrom(target)
 }
 
 // ErrUnavailable is returned by Require when ffplay is missing.

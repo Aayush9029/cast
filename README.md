@@ -42,7 +42,7 @@ The TV is auto-discovered via SSDP on first run. Subsequent casts go to the save
 
 `--local-audio` keeps the video on the TV but plays the soundtrack on this Mac — speakers or AirPods. The TV is muted, and `cast` plays the file's audio track locally with `ffplay`, chasing the TV's playback position so the two stay roughly in lock-step.
 
-Perfect sync is impossible over DLNA (position polling and SOAP add latency), so there's a tunable offset. Pass `--audio-delay 250ms` (positive delays the audio, useful when the TV runs video a beat behind), or dial it in live while playing — `(` and `)` nudge by 10ms, `[` and `]` by 25ms, `{` and `}` by 250ms. The current delay and measured drift show in the TUI. Needs `ffplay` (`brew install ffmpeg`).
+Perfect sync is impossible over DLNA (position polling and SOAP add latency), so there's a tunable offset. Once aligned, the audio free-runs on your Mac's stable clock — it deliberately does **not** chase the TV's reported position moment-to-moment (Samsung's DLNA clock lags seconds and freezes while buffering), and only re-aligns on a large, sustained desync. So once you dial it in, it stays put instead of drifting back. Pass `--audio-delay 250ms` (positive delays the audio, useful when the TV runs video a beat behind), or dial it in live while playing — `(` and `)` nudge by 10ms, `[` and `]` by 25ms, `{` and `}` by 250ms. The current delay and measured drift show in the TUI. Needs `ffplay` (`brew install ffmpeg`).
 
 ## Why this exists
 
