@@ -637,12 +637,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "[":
 			if m.phase == phaseServing && m.player != nil {
-				m.audioDelay -= 50 * time.Millisecond
+				m.audioDelay -= 25 * time.Millisecond
 				return m, nudgeAudioCmd(m.ctx, m.avt, m.player, m.audioDelay)
 			}
 		case "]":
 			if m.phase == phaseServing && m.player != nil {
-				m.audioDelay += 50 * time.Millisecond
+				m.audioDelay += 25 * time.Millisecond
+				return m, nudgeAudioCmd(m.ctx, m.avt, m.player, m.audioDelay)
+			}
+		case "{":
+			if m.phase == phaseServing && m.player != nil {
+				m.audioDelay -= 250 * time.Millisecond
+				return m, nudgeAudioCmd(m.ctx, m.avt, m.player, m.audioDelay)
+			}
+		case "}":
+			if m.phase == phaseServing && m.player != nil {
+				m.audioDelay += 250 * time.Millisecond
 				return m, nudgeAudioCmd(m.ctx, m.avt, m.player, m.audioDelay)
 			}
 		}
@@ -714,7 +724,8 @@ func (m model) View() string {
 		{Key: "space", Label: "play/pause"},
 	}
 	if m.p.LocalAudio {
-		hints = append(hints, tui.HintItem{Key: "[/]", Label: "audio delay"})
+		hints = append(hints, tui.HintItem{Key: "[/]", Label: "delay ±25ms"})
+		hints = append(hints, tui.HintItem{Key: "{/}", Label: "±250ms"})
 	}
 	hints = append(hints,
 		tui.HintItem{Key: "s", Label: "stop"},

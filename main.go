@@ -42,7 +42,8 @@ FLAGS
                                   the audio track is played locally in sync
   --audio-delay <dur>           offset local audio vs. the TV, e.g. 250ms or
                                   -100ms (positive delays audio to match a TV
-                                  that runs video behind). Tune live with [ ]
+                                  that runs video behind). Tune live: [ ] by
+                                  25ms, { } by 250ms
 
 The first cast auto-discovers your TV via SSDP. Run 'cast discover' once
 when you have multiple TVs to pick a default. Config lives at
@@ -51,7 +52,7 @@ when you have multiple TVs to pick a default. Config lives at
 LOCAL AUDIO
   --local-audio needs ffplay (ships with ffmpeg: brew install ffmpeg). Sync is
   bounded by DLNA poll latency, so dial in lip-sync with --audio-delay or the
-  [ and ] keys while playing.
+  [ ] (25ms) and { } (250ms) keys while playing.
 
 ENVIRONMENT
   CAST_PORT      HTTP file-server port (default 8088)
