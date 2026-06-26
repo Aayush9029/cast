@@ -127,6 +127,15 @@ func (c *Client) SeekRelative(ctx context.Context, delta time.Duration) (string,
 	return c.Seek(ctx, formatDLNATime(target))
 }
 
+// Position returns the TV's current relative playback time as a duration.
+func (c *Client) Position(ctx context.Context) (time.Duration, error) {
+	resp, err := c.GetPositionInfo(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return parseDLNATime(CurrentRelTime(resp))
+}
+
 // CurrentTransportState extracts the state from a GetTransportInfo response.
 func CurrentTransportState(resp string) string {
 	return xmlValue(resp, "CurrentTransportState")

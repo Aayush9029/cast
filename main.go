@@ -19,6 +19,7 @@ import (
 	"github.com/Aayush9029/cast/internal/config"
 	"github.com/Aayush9029/cast/internal/discovery"
 	"github.com/Aayush9029/cast/internal/dlna"
+	"github.com/Aayush9029/cast/internal/localaudio"
 	"github.com/Aayush9029/cast/internal/target"
 )
 
@@ -36,10 +37,21 @@ USAGE
 
 FLAGS
   --tv-ip <addr>                target a specific TV (skip auto-discovery)
+  --local-audio                 play video on the TV but route audio to this
+                                  Mac (speakers/AirPods); the TV is muted and
+                                  the audio track is played locally in sync
+  --audio-delay <dur>           offset local audio vs. the TV, e.g. 250ms or
+                                  -100ms (positive delays audio to match a TV
+                                  that runs video behind). Tune live with [ ]
 
 The first cast auto-discovers your TV via SSDP. Run 'cast discover' once
 when you have multiple TVs to pick a default. Config lives at
 ~/.config/cast/config.json.
+
+LOCAL AUDIO
+  --local-audio needs ffplay (ships with ffmpeg: brew install ffmpeg). Sync is
+  bounded by DLNA poll latency, so dial in lip-sync with --audio-delay or the
+  [ and ] keys while playing.
 
 ENVIRONMENT
   CAST_PORT      HTTP file-server port (default 8088)
@@ -61,6 +73,8 @@ func run() error {
 	fs := flag.NewFlagSet("cast", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	tvIP := fs.String("tv-ip", "", "TV IP address (overrides config and discovery)")
+	localAudio := fs.Bool("local-audio", false, "play audio on this Mac, video on the TV")
+	audioDelay := fs.Duration("audio-delay", 0, "offset local audio vs. the TV (e.g. 250ms)")
 	showVer := fs.Bool("version", false, "print version and exit")
 	fs.BoolVar(showVer, "v", false, "print version and exit")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, helpText) }
@@ -116,8 +130,14 @@ func run() error {
 			return err
 		})
 	default:
+		if *localAudio {
+			if err := localaudio.Require(ctx); err != nil {
+				return err
+			}
+		}
+		opts := castOpts{localAudio: *localAudio, audioDelay: *audioDelay}
 		return withAutoRediscover(ctx, tv, *tvIP == "", func(tv target.TV) error {
-			return cmdCast(ctx, tv, args[0])
+			return cmdCast(ctx, tv, args[0], opts)
 		})
 	}
 }
@@ -235,14 +255,25 @@ func cmdClean() error {
 	return nil
 }
 
-func cmdCast(ctx context.Context, tv target.TV, src string) error {
-	if isTerminal(os.Stdout) {
-		return castui.Run(ctx, castui.Params{TV: tv, Source: src, HTTPPort: httpPort()})
-	}
-	return castHeadless(ctx, tv, src)
+type castOpts struct {
+	localAudio bool
+	audioDelay time.Duration
 }
 
-func castHeadless(ctx context.Context, tv target.TV, src string) error {
+func cmdCast(ctx context.Context, tv target.TV, src string, opts castOpts) error {
+	if isTerminal(os.Stdout) {
+		return castui.Run(ctx, castui.Params{
+			TV:         tv,
+			Source:     src,
+			HTTPPort:   httpPort(),
+			LocalAudio: opts.localAudio,
+			AudioDelay: opts.audioDelay,
+		})
+	}
+	return castHeadless(ctx, tv, src, opts)
+}
+
+func castHeadless(ctx context.Context, tv target.TV, src string, opts castOpts) error {
 	path, title, err := resolveSource(ctx, src)
 	if err != nil {
 		return err
@@ -293,6 +324,23 @@ func castHeadless(ctx context.Context, tv target.TV, src string) error {
 	}
 	fmt.Printf("\nPlaying: %s\n  File: %s\n  Ctrl-C to stop\n\n", title, path)
 
+	var player *localaudio.Player
+	if opts.localAudio {
+		rc := dlna.NewRenderingControl(tv.IP)
+		muteCtx, mc := context.WithTimeout(ctx, 5*time.Second)
+		_ = rc.SetMute(muteCtx, true)
+		mc()
+		player = localaudio.New(path)
+		fmt.Fprintf(os.Stderr, "[audio] local playback, delay %s\n", opts.audioDelay)
+		go syncAudioLoop(ctx, avt, player, opts.audioDelay)
+		defer func() {
+			player.Stop()
+			unmuteCtx, uc := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = rc.SetMute(unmuteCtx, false)
+			uc()
+		}()
+	}
+
 	<-ctx.Done()
 	fmt.Fprintln(os.Stderr, "\nstopping...")
 	stopCtx2, cancel3 := context.WithTimeout(context.Background(), 5*time.Second)
@@ -304,6 +352,32 @@ func castHeadless(ctx context.Context, tv target.TV, src string) error {
 	defer cancel4()
 	_ = srv.Shutdown(shutdownCtx)
 	return nil
+}
+
+// syncAudioLoop chases the TV's playback position once a second, stopping the
+// local player whenever the TV is not PLAYING so it resyncs on resume.
+func syncAudioLoop(ctx context.Context, avt *dlna.Client, player *localaudio.Player, offset time.Duration) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			if ti, err := avt.GetTransportInfo(callCtx); err == nil && dlna.CurrentTransportState(ti) != "PLAYING" {
+				player.Stop()
+				cancel()
+				continue
+			}
+			pos, err := avt.Position(callCtx)
+			cancel()
+			if err != nil {
+				continue
+			}
+			_, _, _ = player.Sync(pos, offset)
+		}
+	}
 }
 
 func resolveSource(ctx context.Context, src string) (path, title string, err error) {
