@@ -13,6 +13,7 @@ package castui
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -713,11 +714,11 @@ func (m model) View() string {
 			tui.HintMuted.Render("TV state: ") + tui.StatusOK.Render(state),
 		}
 		if m.p.LocalAudio {
-			rows = append(rows, tui.HintMuted.Render("Audio: ")+
-				tui.StatusOK.Render("this Mac")+
-				tui.HintMuted.Render(fmt.Sprintf("  delay %s  drift %s",
-					m.audioDelay.Round(time.Millisecond),
-					m.audioDrift.Round(time.Millisecond))))
+			rows = append(rows,
+				tui.HintMuted.Render("Audio → ")+tui.StatusOK.Render("this Mac")+
+					tui.HintMuted.Render(fmt.Sprintf("   (drift %s)", m.audioDrift.Round(time.Millisecond))),
+				renderSyncBar(m.audioDelay),
+			)
 		}
 		rows = append(rows, "", m.logView())
 		body = lipgloss.JoinVertical(lipgloss.Left, rows...)
@@ -734,7 +735,7 @@ func (m model) View() string {
 		{Key: "space", Label: "play/pause"},
 	}
 	if m.p.LocalAudio {
-		hints = append(hints, tui.HintItem{Key: "[/]", Label: "delay ±25ms"})
+		hints = append(hints, tui.HintItem{Key: "[/]", Label: "sound ±25ms"})
 		hints = append(hints, tui.HintItem{Key: "(/)", Label: "±10ms"})
 		hints = append(hints, tui.HintItem{Key: "{/}", Label: "±250ms"})
 	}
@@ -744,6 +745,75 @@ func (m model) View() string {
 	)
 	footer := tui.Footer.Render(tui.FormatHints(hints))
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+// syncBarSpan is the half-range the slider maps; delays beyond it clamp to the
+// ends. syncBarHalf is the cell count on each side of the centre tick.
+const (
+	syncBarSpan = 1000 * time.Millisecond
+	syncBarHalf = 16
+)
+
+// renderSyncBar draws a centred A/V-sync slider: a ● marker that slides left
+// (sound earlier than the picture, blue) or right (sound later, amber) from the
+// in-sync centre tick, plus a plain-English caption. It replaces the cryptic
+// "delay ±Nms" readout so the direction of a nudge is obvious at a glance.
+func renderSyncBar(delay time.Duration) string {
+	d := delay
+	if d > syncBarSpan {
+		d = syncBarSpan
+	} else if d < -syncBarSpan {
+		d = -syncBarSpan
+	}
+	pos := syncBarHalf + int(math.Round(float64(d)/float64(syncBarSpan)*float64(syncBarHalf)))
+	width := syncBarHalf*2 + 1
+
+	earlier := lipgloss.NewStyle().Foreground(tui.ColorAccent)
+	later := lipgloss.NewStyle().Foreground(tui.ColorActive)
+	rail := lipgloss.NewStyle().Foreground(tui.ColorBorder)
+	synced := lipgloss.NewStyle().Foreground(tui.ColorOK).Bold(true)
+
+	var b strings.Builder
+	b.WriteString(earlier.Render("◀"))
+	for i := 0; i < width; i++ {
+		switch {
+		case i == pos && pos == syncBarHalf:
+			b.WriteString(synced.Render("●"))
+		case i == pos && pos < syncBarHalf:
+			b.WriteString(earlier.Render("●"))
+		case i == pos:
+			b.WriteString(later.Render("●"))
+		case i == syncBarHalf:
+			b.WriteString(rail.Render("┊"))
+		case i > pos && i < syncBarHalf:
+			b.WriteString(earlier.Render("─"))
+		case i < pos && i > syncBarHalf:
+			b.WriteString(later.Render("─"))
+		default:
+			b.WriteString(rail.Render("─"))
+		}
+	}
+	b.WriteString(later.Render("▶"))
+
+	labels := tui.HintMuted.Render(
+		"sound earlier" + strings.Repeat(" ", width-len("sound earlier")-len("sound later")) + "sound later")
+	return lipgloss.JoinVertical(lipgloss.Left,
+		" "+labels,
+		b.String(),
+		" "+tui.HintMuted.Render(delayCaption(d)),
+	)
+}
+
+func delayCaption(d time.Duration) string {
+	ms := d.Round(time.Millisecond)
+	switch {
+	case ms == 0:
+		return "in sync"
+	case ms > 0:
+		return fmt.Sprintf("sound plays %s after the picture", ms)
+	default:
+		return fmt.Sprintf("sound plays %s before the picture", -ms)
+	}
 }
 
 func (m model) logView() string {
