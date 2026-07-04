@@ -1,6 +1,9 @@
 # build artifact (binary at repo root)
 /cast
 
+# Swift capture helper (cast-capture) build artifacts
+/capture/.build/
+
 # user's global ~/.gitignore ignores `target/` (Rust convention); we have a Go
 # package internal/target that needs to survive.
 !internal/target/

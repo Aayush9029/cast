@@ -98,7 +98,12 @@ func (c *Client) Seek(ctx context.Context, target string) (string, error) {
 // SetAVTransportURI configures the URL and DIDL-Lite metadata. Must be called
 // before Play.
 func (c *Client) SetAVTransportURI(ctx context.Context, streamURL, title string, size int64) (string, error) {
-	didl := BuildDIDL(streamURL, title, size)
+	return c.SetAVTransportURIMeta(ctx, streamURL, BuildDIDL(streamURL, title, size))
+}
+
+// SetAVTransportURIMeta is SetAVTransportURI with a caller-supplied DIDL-Lite
+// blob, used by the live window mirror to send its non-seekable metadata.
+func (c *Client) SetAVTransportURIMeta(ctx context.Context, streamURL, didl string) (string, error) {
 	body := `<u:SetAVTransportURI xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">` +
 		`<InstanceID>0</InstanceID>` +
 		`<CurrentURI>` + xmlEscape(streamURL) + `</CurrentURI>` +

@@ -27,22 +27,35 @@ brew install cast
 ```bash
 cast ~/Movies/movie.mp4         # cast a local file
 cast https://example.com/video  # any yt-dlp-supported URL
+cast window                     # mirror one window + its audio to the TV
 cast discover                   # pick a TV (only needed when you have several)
 cast stop                       # stop playback
-
-cast --local-audio movie.mp4               # video on TV, audio on your Mac/AirPods
-cast --local-audio --audio-delay 250ms ... # offset audio to line up with the TV
 ```
 
 While casting, use the TUI controls: `space` toggles play/pause, `←`/`→` seek 15 seconds, `↑`/`↓` adjust volume, `s` stops playback, and `q` quits.
 
 The TV is auto-discovered via SSDP on first run. Subsequent casts go to the saved TV at `~/.config/cast/config.json`; if that IP stops responding, `cast` rescans the local network and updates the saved target. URL casting needs `yt-dlp` and `ffmpeg` (`brew install yt-dlp ffmpeg`).
 
-## Local audio (private listening)
+Samsung's DLNA renderer expects H.264/AAC in an MP4 container. An `.mkv` (or other non-MP4) file may be refused by the TV — `cast` rejects it up front with the exact `ffmpeg -i in.mkv -c copy out.mp4` command to remux it (near-instant when the codecs already match).
 
-`--local-audio` keeps the video on the TV but plays the soundtrack on this Mac — speakers or AirPods. The TV is muted, and `cast` plays the file's audio track locally with `ffplay`, chasing the TV's playback position so the two stay roughly in lock-step.
+## Window mirroring
 
-Perfect sync is impossible over DLNA (position polling and SOAP add latency), so there's a tunable offset. Once aligned, the audio free-runs on your Mac's stable clock — it deliberately does **not** chase the TV's reported position moment-to-moment (Samsung's DLNA clock lags seconds and freezes while buffering), and only re-aligns on a large, sustained desync. So once you dial it in, it stays put instead of drifting back. Pass `--audio-delay 250ms` (positive delays the audio, useful when the TV runs video a beat behind), or dial it in live while playing — `(` and `)` nudge by 10ms, `[` and `]` by 25ms, `{` and `}` by 250ms. The current delay and measured drift show in the TUI. Needs `ffplay` (`brew install ffmpeg`).
+`cast window` lists your open windows, mirrors the one you pick — video **and** its audio — to the TV. It uses a small Swift/ScreenCaptureKit helper (`cast-capture`) that captures the window's audio directly, so no virtual audio device (BlackHole etc.) is needed. Grant **Screen Recording** permission the first time (System Settings ▸ Privacy & Security ▸ Screen Recording).
+
+```bash
+cast window          # pick a window, then it mirrors to the TV
+CAST_FPS=24 cast window
+```
+
+The helper ships with the Homebrew formula. From source, build it once:
+
+```bash
+cd capture && swift build -c release
+export CAST_CAPTURE="$(swift build -c release --show-bin-path)/cast-capture"
+# or copy that binary next to `cast` / onto your PATH
+```
+
+Caveats: this streams live over DLNA, which is inherently TV-dependent and runs a few seconds behind — great for slides, video, and demos, not for twitch gaming. It captures a single window, not the whole desktop.
 
 ## Why this exists
 

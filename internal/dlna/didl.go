@@ -10,6 +10,27 @@ import (
 // mismatches on arbitrary H.264/AAC MP4s that don't match a named profile.
 const ProtocolInfo = "http-get:*:video/mp4:DLNA.ORG_OP=01;DLNA.ORG_CI=0"
 
+// LiveProtocolInfo describes a live, non-seekable stream: OP=00 (no byte/time
+// seek), CI=1 (transcoded/converted), and the streaming-transfer flag set. Used
+// for the fragmented-MP4 window mirror, which has no length and can't be sought.
+const LiveProtocolInfo = "http-get:*:video/mp4:DLNA.ORG_OP=00;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+
+// BuildLiveDIDL is BuildDIDL for an open-ended live stream: no res size and the
+// live protocolInfo, so the TV treats it as a stream rather than a file.
+func BuildLiveDIDL(streamURL, title string) string {
+	var b strings.Builder
+	b.WriteString(`<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:sec="http://www.sec.co.kr/">`)
+	b.WriteString(`<item id="1" parentID="0" restricted="1">`)
+	b.WriteString("<dc:title>")
+	b.WriteString(xmlEscape(title))
+	b.WriteString("</dc:title>")
+	b.WriteString("<upnp:class>object.item.videoItem</upnp:class>")
+	fmt.Fprintf(&b, `<res protocolInfo="%s">`, LiveProtocolInfo)
+	b.WriteString(xmlEscape(streamURL))
+	b.WriteString("</res></item></DIDL-Lite>")
+	return b.String()
+}
+
 // BuildDIDL produces a DIDL-Lite metadata blob for SetAVTransportURI.
 // The output is a single-line XML string ready to be SOAP-escaped into the
 // <CurrentURIMetaData> element.

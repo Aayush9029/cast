@@ -13,9 +13,9 @@ package castui
 import (
 	"context"
 	"fmt"
-	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,7 +28,6 @@ import (
 
 	"github.com/Aayush9029/cast/internal/cast"
 	"github.com/Aayush9029/cast/internal/dlna"
-	"github.com/Aayush9029/cast/internal/localaudio"
 	"github.com/Aayush9029/cast/internal/target"
 	"github.com/Aayush9029/cast/internal/tui"
 )
@@ -39,13 +38,6 @@ type Params struct {
 	TV       target.TV
 	Source   string
 	HTTPPort string
-
-	// LocalAudio routes audio to this Mac (speakers/AirPods) while video plays
-	// on the TV: the TV is muted and ffplay plays the file's audio track in
-	// sync. AudioDelay offsets local audio relative to the TV (positive delays
-	// audio to match a TV that buffers video behind).
-	LocalAudio bool
-	AudioDelay time.Duration
 }
 
 // Run mounts the TUI and blocks until the user quits or the source fails.
@@ -92,11 +84,6 @@ type model struct {
 	stopRequest bool
 	targetRetry bool
 
-	player     *localaudio.Player
-	audioDelay time.Duration
-	audioDrift time.Duration
-	syncEvery  time.Duration
-
 	dlCh chan string
 
 	w, h int
@@ -128,10 +115,6 @@ type controlDoneMsg struct {
 	err       error
 }
 type stoppedMsg struct{}
-type audioSyncMsg struct {
-	drift time.Duration
-	err   error
-}
 
 func newModel(ctx context.Context, p Params) model {
 	s := spinner.New()
@@ -144,15 +127,13 @@ func newModel(ctx context.Context, p Params) model {
 	avt := dlna.New(p.TV.IP)
 
 	m := model{
-		ctx:        ctx,
-		p:          p,
-		spinner:    s,
-		prog:       pr,
-		avt:        avt,
-		rc:         dlna.NewRenderingControl(p.TV.IP),
-		pollEvery:  2 * time.Second,
-		audioDelay: p.AudioDelay,
-		syncEvery:  time.Second,
+		ctx:       ctx,
+		p:         p,
+		spinner:   s,
+		prog:      pr,
+		avt:       avt,
+		rc:        dlna.NewRenderingControl(p.TV.IP),
+		pollEvery: 2 * time.Second,
 	}
 
 	if isLocalFile(p.Source) {
@@ -238,7 +219,7 @@ func streamURLFor(path, tvIP, port string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("http://%s:%s/%s", ip, port, filepath.Base(path)), nil
+	return fmt.Sprintf("http://%s:%s/%s", ip, port, url.PathEscape(filepath.Base(path))), nil
 }
 
 func playOnTVCmd(ctx context.Context, avt *dlna.Client, streamURL, title string, size int64) tea.Cmd {
@@ -333,71 +314,11 @@ func volumeCmd(ctx context.Context, rc *dlna.RenderingControl, delta int) tea.Cm
 	}
 }
 
-// audioSyncCmd polls the TV's transport state and position, then nudges the
-// local audio player toward tvPos+offset. When the TV is not PLAYING the
-// player is stopped so it resyncs cleanly on resume.
-func audioSyncCmd(ctx context.Context, avt *dlna.Client, player *localaudio.Player, offset, every time.Duration) tea.Cmd {
-	return tea.Tick(every, func(_ time.Time) tea.Msg {
-		callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		defer cancel()
-		if ti, err := avt.GetTransportInfo(callCtx); err == nil && dlna.CurrentTransportState(ti) != "PLAYING" {
-			player.Stop()
-			return audioSyncMsg{}
-		}
-		pos, err := avt.Position(callCtx)
-		if err != nil {
-			return audioSyncMsg{err: err}
-		}
-		drift, _, serr := player.Sync(pos, offset)
-		return audioSyncMsg{drift: drift, err: serr}
-	})
-}
-
-// nudgeAudioCmd reseeks the local player immediately to the TV position plus
-// the new offset, so delay tweaks take effect without waiting for the next
-// drift tick.
-func nudgeAudioCmd(ctx context.Context, avt *dlna.Client, player *localaudio.Player, offset time.Duration) tea.Cmd {
+func stopOnTVCmd(avt *dlna.Client, srv *http.Server) tea.Cmd {
 	return func() tea.Msg {
-		callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		defer cancel()
-		pos, err := avt.Position(callCtx)
-		if err != nil {
-			return controlDoneMsg{err: err}
-		}
-		if err := player.PlayFrom(pos + offset); err != nil {
-			return controlDoneMsg{err: err}
-		}
-		return controlDoneMsg{status: fmt.Sprintf("audio delay %s", offset)}
-	}
-}
-
-func muteTVCmd(ctx context.Context, rc *dlna.RenderingControl, mute bool) tea.Cmd {
-	return func() tea.Msg {
-		callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		if err := rc.SetMute(callCtx, mute); err != nil {
-			return controlDoneMsg{err: err}
-		}
-		if mute {
-			return controlDoneMsg{status: "TV muted — audio on this Mac"}
-		}
-		return controlDoneMsg{status: "TV unmuted"}
-	}
-}
-
-func stopOnTVCmd(avt *dlna.Client, rc *dlna.RenderingControl, srv *http.Server, player *localaudio.Player) tea.Cmd {
-	return func() tea.Msg {
-		if player != nil {
-			player.Stop()
-		}
 		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_, _ = avt.Stop(stopCtx)
-		if player != nil && rc != nil {
-			unmuteCtx, uc := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = rc.SetMute(unmuteCtx, false)
-			uc()
-		}
 		if srv != nil {
 			shutCtx, sc := context.WithTimeout(context.Background(), 3*time.Second)
 			defer sc()
@@ -505,27 +426,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if st, err := os.Stat(m.cachePath); err == nil {
 			size = st.Size()
 		}
-		cmds := []tea.Cmd{
+		return m, tea.Batch(
 			playOnTVCmd(m.ctx, m.avt, m.streamURL, m.title, size),
 			pollStateCmd(m.ctx, m.avt, m.pollEvery),
-		}
-		if m.p.LocalAudio {
-			m.player = localaudio.New(m.cachePath)
-			cmds = append(cmds,
-				muteTVCmd(m.ctx, m.rc, true),
-				audioSyncCmd(m.ctx, m.avt, m.player, m.audioDelay, m.syncEvery),
-			)
-		}
-		return m, tea.Batch(cmds...)
-
-	case audioSyncMsg:
-		if m.phase != phaseServing || m.player == nil {
-			return m, nil
-		}
-		if msg.err == nil {
-			m.audioDrift = msg.drift
-		}
-		return m, audioSyncCmd(m.ctx, m.avt, m.player, m.audioDelay, m.syncEvery)
+		)
 
 	case stateMsg:
 		if m.phase != phaseServing {
@@ -569,17 +473,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if st, err := os.Stat(m.cachePath); err == nil {
 			size = st.Size()
 		}
-		cmds := []tea.Cmd{
+		return m, tea.Batch(
 			playOnTVCmd(m.ctx, m.avt, m.streamURL, m.title, size),
 			pollStateCmd(m.ctx, m.avt, m.pollEvery),
-		}
-		if m.p.LocalAudio && m.player != nil {
-			cmds = append(cmds,
-				muteTVCmd(m.ctx, m.rc, true),
-				audioSyncCmd(m.ctx, m.avt, m.player, m.audioDelay, m.syncEvery),
-			)
-		}
-		return m, tea.Batch(cmds...)
+		)
 
 	case controlDoneMsg:
 		if msg.err != nil {
@@ -608,13 +505,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c", "q":
 			if m.phase == phaseServing && !m.stopRequest {
 				m.stopRequest = true
-				return m, stopOnTVCmd(m.avt, m.rc, m.server, m.player)
+				return m, stopOnTVCmd(m.avt, m.server)
 			}
 			return m, tea.Quit
 		case "s":
 			if m.phase == phaseServing && !m.stopRequest {
 				m.stopRequest = true
-				return m, stopOnTVCmd(m.avt, m.rc, m.server, m.player)
+				return m, stopOnTVCmd(m.avt, m.server)
 			}
 		case " ", "space":
 			if m.phase == phaseServing {
@@ -635,36 +532,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "right":
 			if m.phase == phaseServing {
 				return m, seekCmd(m.ctx, m.avt, 15*time.Second)
-			}
-		case "[":
-			if m.phase == phaseServing && m.player != nil {
-				m.audioDelay -= 25 * time.Millisecond
-				return m, nudgeAudioCmd(m.ctx, m.avt, m.player, m.audioDelay)
-			}
-		case "]":
-			if m.phase == phaseServing && m.player != nil {
-				m.audioDelay += 25 * time.Millisecond
-				return m, nudgeAudioCmd(m.ctx, m.avt, m.player, m.audioDelay)
-			}
-		case "{":
-			if m.phase == phaseServing && m.player != nil {
-				m.audioDelay -= 250 * time.Millisecond
-				return m, nudgeAudioCmd(m.ctx, m.avt, m.player, m.audioDelay)
-			}
-		case "}":
-			if m.phase == phaseServing && m.player != nil {
-				m.audioDelay += 250 * time.Millisecond
-				return m, nudgeAudioCmd(m.ctx, m.avt, m.player, m.audioDelay)
-			}
-		case "(":
-			if m.phase == phaseServing && m.player != nil {
-				m.audioDelay -= 10 * time.Millisecond
-				return m, nudgeAudioCmd(m.ctx, m.avt, m.player, m.audioDelay)
-			}
-		case ")":
-			if m.phase == phaseServing && m.player != nil {
-				m.audioDelay += 10 * time.Millisecond
-				return m, nudgeAudioCmd(m.ctx, m.avt, m.player, m.audioDelay)
 			}
 		}
 	}
@@ -713,13 +580,6 @@ func (m model) View() string {
 			urlBox,
 			tui.HintMuted.Render("TV state: ") + tui.StatusOK.Render(state),
 		}
-		if m.p.LocalAudio {
-			rows = append(rows,
-				tui.HintMuted.Render("Audio → ")+tui.StatusOK.Render("this Mac")+
-					tui.HintMuted.Render(fmt.Sprintf("   (drift %s)", m.audioDrift.Round(time.Millisecond))),
-				renderSyncBar(m.audioDelay),
-			)
-		}
 		rows = append(rows, "", m.logView())
 		body = lipgloss.JoinVertical(lipgloss.Left, rows...)
 	case phaseDone:
@@ -733,87 +593,11 @@ func (m model) View() string {
 		{Key: "↑/↓", Label: "volume"},
 		{Key: "←/→", Label: "seek 15s"},
 		{Key: "space", Label: "play/pause"},
+		{Key: "s", Label: "stop"},
+		{Key: "q", Label: "quit"},
 	}
-	if m.p.LocalAudio {
-		hints = append(hints, tui.HintItem{Key: "[/]", Label: "sound ±25ms"})
-		hints = append(hints, tui.HintItem{Key: "(/)", Label: "±10ms"})
-		hints = append(hints, tui.HintItem{Key: "{/}", Label: "±250ms"})
-	}
-	hints = append(hints,
-		tui.HintItem{Key: "s", Label: "stop"},
-		tui.HintItem{Key: "q", Label: "quit"},
-	)
 	footer := tui.Footer.Render(tui.FormatHints(hints))
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
-}
-
-// syncBarSpan is the half-range the slider maps; delays beyond it clamp to the
-// ends. syncBarHalf is the cell count on each side of the centre tick.
-const (
-	syncBarSpan = 1000 * time.Millisecond
-	syncBarHalf = 16
-)
-
-// renderSyncBar draws a centred A/V-sync slider: a ● marker that slides left
-// (sound earlier than the picture, blue) or right (sound later, amber) from the
-// in-sync centre tick, plus a plain-English caption. It replaces the cryptic
-// "delay ±Nms" readout so the direction of a nudge is obvious at a glance.
-func renderSyncBar(delay time.Duration) string {
-	d := delay
-	if d > syncBarSpan {
-		d = syncBarSpan
-	} else if d < -syncBarSpan {
-		d = -syncBarSpan
-	}
-	pos := syncBarHalf + int(math.Round(float64(d)/float64(syncBarSpan)*float64(syncBarHalf)))
-	width := syncBarHalf*2 + 1
-
-	earlier := lipgloss.NewStyle().Foreground(tui.ColorAccent)
-	later := lipgloss.NewStyle().Foreground(tui.ColorActive)
-	rail := lipgloss.NewStyle().Foreground(tui.ColorBorder)
-	synced := lipgloss.NewStyle().Foreground(tui.ColorOK).Bold(true)
-
-	var b strings.Builder
-	b.WriteString(earlier.Render("◀"))
-	for i := 0; i < width; i++ {
-		switch {
-		case i == pos && pos == syncBarHalf:
-			b.WriteString(synced.Render("●"))
-		case i == pos && pos < syncBarHalf:
-			b.WriteString(earlier.Render("●"))
-		case i == pos:
-			b.WriteString(later.Render("●"))
-		case i == syncBarHalf:
-			b.WriteString(rail.Render("┊"))
-		case i > pos && i < syncBarHalf:
-			b.WriteString(earlier.Render("─"))
-		case i < pos && i > syncBarHalf:
-			b.WriteString(later.Render("─"))
-		default:
-			b.WriteString(rail.Render("─"))
-		}
-	}
-	b.WriteString(later.Render("▶"))
-
-	labels := tui.HintMuted.Render(
-		"sound earlier" + strings.Repeat(" ", width-len("sound earlier")-len("sound later")) + "sound later")
-	return lipgloss.JoinVertical(lipgloss.Left,
-		" "+labels,
-		b.String(),
-		" "+tui.HintMuted.Render(delayCaption(d)),
-	)
-}
-
-func delayCaption(d time.Duration) string {
-	ms := d.Round(time.Millisecond)
-	switch {
-	case ms == 0:
-		return "in sync"
-	case ms > 0:
-		return fmt.Sprintf("sound plays %s after the picture", ms)
-	default:
-		return fmt.Sprintf("sound plays %s before the picture", -ms)
-	}
 }
 
 func (m model) logView() string {
@@ -834,9 +618,11 @@ func shouldRescanPlaybackError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// Only transport-level failures (the TV is unreachable) warrant a rescan. A
+	// SOAP UPnPError fault means the TV answered, so rescanning won't help — it
+	// would just bury the real error (e.g. 716 Resource not found).
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "soap ") ||
-		strings.Contains(msg, "dial tcp") ||
+	return strings.Contains(msg, "dial tcp") ||
 		strings.Contains(msg, "connect:") ||
 		strings.Contains(msg, "host is down") ||
 		strings.Contains(msg, "network is unreachable") ||

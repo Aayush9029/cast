@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -19,7 +21,7 @@ import (
 	"github.com/Aayush9029/cast/internal/config"
 	"github.com/Aayush9029/cast/internal/discovery"
 	"github.com/Aayush9029/cast/internal/dlna"
-	"github.com/Aayush9029/cast/internal/localaudio"
+	"github.com/Aayush9029/cast/internal/mirror"
 	"github.com/Aayush9029/cast/internal/target"
 )
 
@@ -29,6 +31,7 @@ const helpText = `cast - stream a video file to a Samsung TV
 
 USAGE
   cast <file-or-url>            cast a local file (or any yt-dlp URL)
+  cast window                   mirror a single window + its audio to the TV
   cast discover                 scan for TVs and save one
   cast stop                     stop playback on the current TV
   cast cache                    list cached downloads
@@ -37,27 +40,24 @@ USAGE
 
 FLAGS
   --tv-ip <addr>                target a specific TV (skip auto-discovery)
-  --local-audio                 play video on the TV but route audio to this
-                                  Mac (speakers/AirPods); the TV is muted and
-                                  the audio track is played locally in sync
-  --audio-delay <dur>           offset local audio vs. the TV, e.g. 250ms or
-                                  -100ms (positive delays audio to match a TV
-                                  that runs video behind). Tune live: ( ) by
-                                  10ms, [ ] by 25ms, { } by 250ms
 
 The first cast auto-discovers your TV via SSDP. Run 'cast discover' once
 when you have multiple TVs to pick a default. Config lives at
 ~/.config/cast/config.json.
 
-LOCAL AUDIO
-  --local-audio needs ffplay (ships with ffmpeg: brew install ffmpeg). Sync is
-  bounded by DLNA poll latency, so dial in lip-sync with --audio-delay or the
-  ( ) (10ms), [ ] (25ms) and { } (250ms) keys while playing.
+WINDOW MIRRORING
+  'cast window' lists your open windows, mirrors the one you pick — video and
+  its audio — to the TV using ScreenCaptureKit. Needs the cast-capture helper
+  (installed with the brew formula) and Screen Recording permission (System
+  Settings > Privacy & Security > Screen Recording). Live DLNA streaming is
+  TV-dependent and runs a few seconds behind; it's best for slides/video, not
+  twitch gaming.
 
 ENVIRONMENT
   CAST_PORT      HTTP file-server port (default 8088)
   CAST_CACHE     cache dir for downloaded files (default /tmp/cast-cache)
   CAST_COOKIES   --cookies-from-browser value for yt-dlp (default safari)
+  CAST_CAPTURE   path to the cast-capture helper (default: next to cast)
 `
 
 func main() {
@@ -74,8 +74,6 @@ func run() error {
 	fs := flag.NewFlagSet("cast", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	tvIP := fs.String("tv-ip", "", "TV IP address (overrides config and discovery)")
-	localAudio := fs.Bool("local-audio", false, "play audio on this Mac, video on the TV")
-	audioDelay := fs.Duration("audio-delay", 0, "offset local audio vs. the TV (e.g. 250ms)")
 	showVer := fs.Bool("version", false, "print version and exit")
 	fs.BoolVar(showVer, "v", false, "print version and exit")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, helpText) }
@@ -114,6 +112,14 @@ func run() error {
 		return cmdClean()
 	}
 
+	// Validate a local source before we bother resolving a TV, so a bad file
+	// reports the real problem instead of "no TV found".
+	if args[0] != "stop" && args[0] != "window" {
+		if err := checkCastable(args[0]); err != nil {
+			return err
+		}
+	}
+
 	tv, err := target.Resolve(ctx, *tvIP)
 	if err != nil {
 		return err
@@ -130,15 +136,11 @@ func run() error {
 			}
 			return err
 		})
+	case "window":
+		return cmdWindow(ctx, tv)
 	default:
-		if *localAudio {
-			if err := localaudio.Require(ctx); err != nil {
-				return err
-			}
-		}
-		opts := castOpts{localAudio: *localAudio, audioDelay: *audioDelay}
 		return withAutoRediscover(ctx, tv, *tvIP == "", func(tv target.TV) error {
-			return cmdCast(ctx, tv, args[0], opts)
+			return cmdCast(ctx, tv, args[0])
 		})
 	}
 }
@@ -163,9 +165,11 @@ func shouldRescanAfter(err error) bool {
 	if err == nil {
 		return false
 	}
+	// Only transport-level failures (the TV is unreachable) warrant a rescan.
+	// A SOAP UPnPError fault means the TV answered — rescanning won't help and
+	// just masks the real error (e.g. 716 Resource not found on a bad URL).
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "soap ") ||
-		strings.Contains(msg, "dial tcp") ||
+	return strings.Contains(msg, "dial tcp") ||
 		strings.Contains(msg, "connect:") ||
 		strings.Contains(msg, "host is down") ||
 		strings.Contains(msg, "network is unreachable") ||
@@ -256,25 +260,44 @@ func cmdClean() error {
 	return nil
 }
 
-type castOpts struct {
-	localAudio bool
-	audioDelay time.Duration
+// checkCastable rejects a local source the TV can't play. Samsung's DLNA
+// renderer only reliably plays H.264/AAC in an MP4 container, and local files
+// pass through untouched, so a non-MP4 gets a remux hint up front instead of a
+// cryptic UPnPError. URL sources are left alone: yt-dlp always merges to MP4.
+func checkCastable(src string) error {
+	st, err := os.Stat(src)
+	if err != nil || st.IsDir() || isMP4Container(src) {
+		return nil
+	}
+	out := strings.TrimSuffix(src, filepath.Ext(src)) + ".mp4"
+	return fmt.Errorf("%s is not an MP4 — Samsung TVs need H.264/AAC in an MP4 container.\n"+
+		"Remux first (instant when it's already H.264/AAC, no re-encode):\n"+
+		"  ffmpeg -i %q -c copy %q\n"+
+		"then: cast %q", filepath.Base(src), src, out, out)
 }
 
-func cmdCast(ctx context.Context, tv target.TV, src string, opts castOpts) error {
+func cmdCast(ctx context.Context, tv target.TV, src string) error {
 	if isTerminal(os.Stdout) {
 		return castui.Run(ctx, castui.Params{
-			TV:         tv,
-			Source:     src,
-			HTTPPort:   httpPort(),
-			LocalAudio: opts.localAudio,
-			AudioDelay: opts.audioDelay,
+			TV:       tv,
+			Source:   src,
+			HTTPPort: httpPort(),
 		})
 	}
-	return castHeadless(ctx, tv, src, opts)
+	return castHeadless(ctx, tv, src)
 }
 
-func castHeadless(ctx context.Context, tv target.TV, src string, opts castOpts) error {
+// isMP4Container reports whether the path has an MP4-family extension the TV
+// can play. .mov/.m4v are the same ISO-BMFF container as .mp4.
+func isMP4Container(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".mp4", ".m4v", ".mov":
+		return true
+	}
+	return false
+}
+
+func castHeadless(ctx context.Context, tv target.TV, src string) error {
 	path, title, err := resolveSource(ctx, src)
 	if err != nil {
 		return err
@@ -289,7 +312,7 @@ func castHeadless(ctx context.Context, tv target.TV, src string, opts castOpts) 
 	if err != nil {
 		return err
 	}
-	streamURL := fmt.Sprintf("http://%s:%s/%s", ip, httpPort(), filepath.Base(path))
+	streamURL := fmt.Sprintf("http://%s:%s/%s", ip, httpPort(), url.PathEscape(filepath.Base(path)))
 	fmt.Fprintf(os.Stderr, "[serve] %s  (%d MB)\n", streamURL, size/1024/1024)
 
 	listener, err := net.Listen("tcp", "0.0.0.0:"+httpPort())
@@ -325,22 +348,93 @@ func castHeadless(ctx context.Context, tv target.TV, src string, opts castOpts) 
 	}
 	fmt.Printf("\nPlaying: %s\n  File: %s\n  Ctrl-C to stop\n\n", title, path)
 
-	var player *localaudio.Player
-	if opts.localAudio {
-		rc := dlna.NewRenderingControl(tv.IP)
-		muteCtx, mc := context.WithTimeout(ctx, 5*time.Second)
-		_ = rc.SetMute(muteCtx, true)
-		mc()
-		player = localaudio.New(path)
-		fmt.Fprintf(os.Stderr, "[audio] local playback, delay %s\n", opts.audioDelay)
-		go syncAudioLoop(ctx, avt, player, opts.audioDelay)
-		defer func() {
-			player.Stop()
-			unmuteCtx, uc := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = rc.SetMute(unmuteCtx, false)
-			uc()
-		}()
+	<-ctx.Done()
+	fmt.Fprintln(os.Stderr, "\nstopping...")
+	stopCtx2, cancel3 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel3()
+	if _, err := avt.Stop(stopCtx2); err != nil {
+		fmt.Fprintf(os.Stderr, "stop: %v\n", err)
 	}
+	shutdownCtx, cancel4 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel4()
+	_ = srv.Shutdown(shutdownCtx)
+	return nil
+}
+
+// cmdWindow mirrors a single window + its audio to the TV: it lists windows via
+// the ScreenCaptureKit helper, prompts for one, then captures it as live
+// fragmented MP4 and serves that stream to the TV over DLNA.
+func cmdWindow(ctx context.Context, tv target.TV) error {
+	windows, err := mirror.ListWindows(ctx)
+	if err != nil {
+		return err
+	}
+	if len(windows) == 0 {
+		return errors.New("no capturable windows found — open the app you want to mirror")
+	}
+
+	win := windows[0]
+	if len(windows) > 1 {
+		fmt.Fprintln(os.Stderr, "windows:")
+		for i, w := range windows {
+			fmt.Fprintf(os.Stderr, "  [%d] %s\n", i+1, w.Label())
+		}
+		fmt.Fprintf(os.Stderr, "pick (1-%d): ", len(windows))
+		var n int
+		if _, err := fmt.Scanln(&n); err != nil {
+			return fmt.Errorf("read selection: %w", err)
+		}
+		if n < 1 || n > len(windows) {
+			return errors.New("out of range")
+		}
+		win = windows[n-1]
+	}
+
+	capture, err := mirror.Start(ctx, win.ID, mirrorFPS())
+	if err != nil {
+		return err
+	}
+	defer capture.Stop()
+
+	ip, err := cast.MyLANIP(tv.IP)
+	if err != nil {
+		return err
+	}
+	streamURL := fmt.Sprintf("http://%s:%s/window.mp4", ip, httpPort())
+
+	listener, err := net.Listen("tcp", "0.0.0.0:"+httpPort())
+	if err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/", &mirror.LiveHandler{Body: capture.Reader()})
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 30 * time.Second}
+	go func() {
+		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "[http] %v\n", err)
+		}
+	}()
+
+	avt := dlna.New(tv.IP)
+	stopCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	_, _ = avt.Stop(stopCtx)
+	cancel()
+	time.Sleep(300 * time.Millisecond)
+
+	title := win.App + " — " + strings.TrimSpace(win.Title)
+	setCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if _, err := avt.SetAVTransportURIMeta(setCtx, streamURL, dlna.BuildLiveDIDL(streamURL, title)); err != nil {
+		return err
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	playCtx, cancel2 := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel2()
+	if _, err := avt.Play(playCtx); err != nil {
+		return err
+	}
+	fmt.Printf("\nMirroring: %s\n  Stream: %s\n  Ctrl-C to stop\n\n", title, streamURL)
 
 	<-ctx.Done()
 	fmt.Fprintln(os.Stderr, "\nstopping...")
@@ -355,30 +449,14 @@ func castHeadless(ctx context.Context, tv target.TV, src string, opts castOpts) 
 	return nil
 }
 
-// syncAudioLoop chases the TV's playback position once a second, stopping the
-// local player whenever the TV is not PLAYING so it resyncs on resume.
-func syncAudioLoop(ctx context.Context, avt *dlna.Client, player *localaudio.Player, offset time.Duration) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-			if ti, err := avt.GetTransportInfo(callCtx); err == nil && dlna.CurrentTransportState(ti) != "PLAYING" {
-				player.Stop()
-				cancel()
-				continue
-			}
-			pos, err := avt.Position(callCtx)
-			cancel()
-			if err != nil {
-				continue
-			}
-			_, _, _ = player.Sync(pos, offset)
+// mirrorFPS is the window-capture frame rate, overridable via CAST_FPS.
+func mirrorFPS() int {
+	if v := os.Getenv("CAST_FPS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 60 {
+			return n
 		}
 	}
+	return 30
 }
 
 func resolveSource(ctx context.Context, src string) (path, title string, err error) {

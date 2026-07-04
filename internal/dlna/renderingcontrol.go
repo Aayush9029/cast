@@ -86,19 +86,6 @@ func (c *RenderingControl) AdjustVolume(ctx context.Context, delta int) (int, er
 	return volume, nil
 }
 
-// SetMute mutes or unmutes the TV's master channel.
-func (c *RenderingControl) SetMute(ctx context.Context, mute bool) error {
-	desired := "0"
-	if mute {
-		desired = "1"
-	}
-	_, err := c.soap(ctx, "SetMute",
-		`<u:SetMute xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1">`+
-			`<InstanceID>0</InstanceID><Channel>Master</Channel>`+
-			`<DesiredMute>`+desired+`</DesiredMute></u:SetMute>`)
-	return err
-}
-
 // CurrentVolume extracts CurrentVolume from a GetVolume response.
 func CurrentVolume(resp string) (int, error) {
 	const open = "<CurrentVolume>"
